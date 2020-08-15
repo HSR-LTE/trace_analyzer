@@ -1,12 +1,15 @@
 import argparse
 from matplotlib import pyplot as plt
-from helper_func import *
+from lib.packets import *
+from lib.processors import *
 
 parser = argparse.ArgumentParser()
 parser.add_argument('client_csv')
+parser.add_argument('--plotter', '-p', choices=['rtt', 'bw', 'bif'], required=True)
 parser.add_argument('--server-csv', '-s')
 parser.add_argument('--timestamp-align', '-t')
 parser.add_argument('--no-detail-box', action='store_true')
+parser.add_argument('--highlight-retransmission', action='store_true')
 args = parser.parse_args()
 
 try:
@@ -16,83 +19,15 @@ try:
 except ValueError:
     pass
 
-# timestamp_delta = -0.037
+plotter_dict = {'rtt': (ClientRttPlotter, ServerRttPlotter, ), \
+                'bw' : (ClientBwPlotter,  ServerBwPlotter,  ), \
+                'bif': (ClientBifPlotter, ServerBifPlotter, ), }
 
-class WindowGoodput:
-    def finalize(self, smooth_factor):
-        for i in range(len(self.points)):
-            self.points[i][1] /= self.window
-        if smooth_factor == 1:
-            return
-        for i in range(1, len(self.points)):
-            self.points[i][1] = (1 - smooth_factor) * self.points[i - 1][1] \
-                            + smooth_factor * self.points[i][1]
+client_records, client_data_records, client_ack_records = read_records(args.client_csv)
 
-    def plot(self):
-        x = list(map(lambda x: x[0], self.points))
-        y = list(map(lambda x: x[1], self.points))
-        plt.plot(x, y)
-        return plt.scatter(x, y)
-
-class SlidingWindowGoodput(WindowGoodput):
-    def __init__(self, window):
-        self.window = window
-        self.points = []
-        self.data_in_window = []
-        self.data_size = 0
-
-    def append(self, time, size):
-        self.data_in_window += [[time, size]]
-        self.data_size += size
-        while self.data_in_window[0][0] + self.window <= time:
-            self.data_size -= self.data_in_window[0][1]
-            self.data_in_window = self.data_in_window[1:]
-        self.points += [[time, self.data_size]]
-
-    def finalize(self):
-        super().finalize(1)
-
-class ConsecutiveWindowGoodput(WindowGoodput):
-    def __init__(self, window):
-        self.window = window
-        self.points = []
-
-    def append(self, time, size):
-        if not self.points:
-            self.points += [[time, size]]
-            return
-        while self.points[-1][0] + self.window <= time:
-            self.points += [[self.points[-1][0] + self.window, 0]]
-        self.points[-1][1] += size
-
-    def finalize(self, factor):
-        for i in range(len(self.points)):
-            self.points[i][0] += self.window
-        super().finalize(factor)
-
-client_records, client_data_records, client_ack_records = read_packets(args.client_csv)
-
-bandwidth_radio = ConsecutiveWindowGoodput(0.01)
-bandwidth_client = SlidingWindowGoodput(0.25)
-
-time_base = None
-
-for pkt in client_data_records:
-    size = int(pkt['tcp.len'])
-    time = float(pkt['timestamp'])
-
-    if time_base is None:
-        time_base = time
-    time -= time_base
-
-    bandwidth_radio.append(time, size)
-    bandwidth_client.append(time, size)
-
-bandwidth_radio.finalize(0.125)
-bandwidth_client.finalize()
-
+server_records = []
 if args.server_csv:
-    server_records, server_data_records, server_ack_records = read_packets(args.server_csv)
+    server_records, server_data_records, server_ack_records = read_records(args.server_csv)
 
 if args.server_csv and not args.timestamp_align:
     timestamp_delta_min = float('-inf')
@@ -131,37 +66,17 @@ if args.server_csv and not args.timestamp_align:
             f'from the interval [{timestamp_delta_min}, {timestamp_delta_max}]')
 elif args.timestamp_align:
     args.timestamp_align = float(args.timestamp_align)
+else:
+    args.timestamp_align = 0
 
-if args.server_csv:
-    bandwidth_server_data = SlidingWindowGoodput(0.25)
-    bandwidth_server_ack = SlidingWindowGoodput(0.25)
+packets = get_packets(client_records, server_records, args.timestamp_align)
+ClientServerMatcher().process(packets)
 
-    for pkt in server_data_records:
-        size = int(pkt['tcp.len'])
-        time = float(pkt['timestamp']) - time_base
-        bandwidth_server_data.append(time + args.timestamp_align, size)
-
-    last_ack = None
-    idx = 0
-    for pkt in server_ack_records:
-        ack = int(pkt['tcp.ack'])
-        if ack == 0:
-            continue
-        if last_ack is None:
-            last_ack = ack
-        if ack <= last_ack:
-            pkt.pop('ack_id')
-            continue
-
-        size = ack - last_ack
-        time = float(pkt['timestamp']) - time_base
-        bandwidth_server_ack.append(time + args.timestamp_align, size)
-        pkt['ack_id'] = idx
-        last_ack = ack
-        idx += 1
-
-    bandwidth_server_data.finalize()
-    bandwidth_server_ack.finalize()
+client_plotter, server_plotter = plotter_dict[args.plotter]
+client_plotter = client_plotter()
+server_plotter = server_plotter()
+client_plotter.process(packets)
+server_plotter.process(packets)
 
 fig, ax = plt.subplots()
 annot = ax.annotate("", xy=(0, 0),
@@ -169,19 +84,16 @@ annot = ax.annotate("", xy=(0, 0),
         textcoords="offset points", xytext=(20, 20))
 annot.set_visible(False)
 
-bandwidth_radio.plot()
-sc_client = bandwidth_client.plot()
-if args.server_csv:
-    sc_server_data = bandwidth_server_data.plot()
-    sc_server_ack = bandwidth_server_ack.plot()
+sc_client, = client_plotter.plot()
+sc_server_data, sc_server_ack = server_plotter.plot()
 
 new_lines = []
 
-def draw_new_line(point1, point2):
+def draw_new_line(point1, point2, fmt='-.k', **kwargs):
     global new_lines
     x = [point1[0], point2[0]]
     y = [point1[1], point2[1]]
-    new_lines += plt.plot(x, y, '-.k')
+    new_lines += plt.plot(x, y, fmt, **kwargs)
 
 def clean_new_lines():
     global new_lines
@@ -189,67 +101,16 @@ def clean_new_lines():
         line.remove()
     new_lines = []
 
-def packet_text_to_disply(client_data_pkt):
-    error_str = f"Client Packet No. {client_data_pkt['_ws.col.No.']}\n"
-
-    client_ack_pkt = packet_search(client_records, client_data_pkt['id'], packet_check_ack, client_data_pkt)
-    if client_ack_pkt is None:
-        error_str += "ERROR: Cannot find the corresponding ACK packet."
-        return error_str
-
-    server_data_pkt = packet_search(server_records, 0, packet_check_equal, client_data_pkt)
-    if server_data_pkt is not None:
-        server_ack_pkt = packet_search(server_records, server_data_pkt['id'], packet_check_equal, client_ack_pkt)
-    if server_data_pkt is None or server_ack_pkt is None:
-        error_str += "ERROR: Cannot find the corresponding packets in server records."
-        return error_str
-
-    result_str = ""
-    result_str += f"Server Data No. {server_data_pkt['_ws.col.No.']}\n"
-    result_str += f"Client Data No. {client_data_pkt['_ws.col.No.']}\n"
-    result_str += f"Client ACK No. {client_ack_pkt['_ws.col.No.']}\n"
-    result_str += f"Server ACK No. {server_ack_pkt['_ws.col.No.']}\n"
-    result_str += f"Server RTT: {server_ack_pkt['tcp.analysis.ack_rtt']}\n"
-    result_str += f"Client ACK Delay: {float(client_ack_pkt['timestamp']) - float(client_data_pkt['timestamp'])}\n"
-    result_str += "\n"
-
-    server_last_pkt = server_data_pkt['data_id'] + 1
-    while float(server_data_records[server_last_pkt]['timestamp']) + \
-            args.timestamp_align <= float(client_ack_pkt['timestamp']):
-        server_last_pkt += 1
-    server_last_pkt = server_data_records[server_last_pkt - 1]
-    result_str += "Bytes in fly: " + \
-            f"{int(server_last_pkt['tcp.seq']) + int(server_last_pkt['tcp.len']) - int(client_ack_pkt['tcp.ack'])}"
-    result_str += "\n\n"
-
-    server_new_pkt = packet_search(server_records, server_ack_pkt['id'],
-            lambda pkt: pkt['_ws.col.Destination'] == server_ack_pkt['_ws.col.Source'] and \
-                    int(pkt['tcp.options.timestamp.tsecr']) >= int(server_ack_pkt['tcp.options.timestamp.tsval']))
-    if server_new_pkt is not None:
-        client_new_pkt = packet_search(client_records, client_ack_pkt['id'], packet_check_equal, server_new_pkt)
-    if server_new_pkt is not None and client_new_pkt is not None:
-        result_str += f"Server New No. {server_new_pkt['_ws.col.No.']}\n"
-        result_str += f"Client New No. {client_new_pkt['_ws.col.No.']}\n"
-        result_str += f"Client RTT: {float(client_new_pkt['timestamp']) - float(client_ack_pkt['timestamp'])}"
-    else:
-        result_str += "Failed to measure the client-side RTT."
-
-    sid = server_data_pkt.get('data_id')
-    cid = client_data_pkt.get('data_id')
-    if sid is not None and cid is not None:
-        draw_new_line(sc_client.get_offsets()[cid], sc_server_data.get_offsets()[sid])
-
-    ack_id = server_ack_pkt.get('ack_id')
-    if ack_id is not None and cid is not None:
-        draw_new_line(sc_client.get_offsets()[cid], sc_server_ack.get_offsets()[ack_id])
-
-    if server_new_pkt is not None and client_new_pkt is not None:
-        sid = server_new_pkt.get('data_id')
-        cid = client_new_pkt.get('data_id')
-        if sid is not None and cid is not None:
-            draw_new_line(sc_client.get_offsets()[cid], sc_server_data.get_offsets()[sid])
-
-    return result_str
+if args.highlight_retransmission and args.server_csv:
+    for pkt in packets:
+        if pkt.type != PACKET_SERVER_DATA:
+            continue
+        if pkt.retrans is None:
+            continue
+        offsets = sc_server_data.get_offsets()
+        draw_new_line(offsets[pkt.curve_id], \
+                offsets[pkt.retrans.curve_id], '#808080', alpha=0.3)
+    new_lines = []
 
 class MouseEventHandler:
     def onpress(self, event):
@@ -264,20 +125,63 @@ class MouseEventHandler:
         clean_new_lines()
 
         ok, ind = sc_client.contains(event)
-        if not ok:
-            annot.set_visible(False)
+        if ok:
+            ind = ind['ind'][0]
+            client_data_pkt = client_plotter.curve_packets[ind]
+            server_data_pkt = getattr(client_data_pkt, 'pair_pkt', None)
+            self.draw_information(client_data_pkt, server_data_pkt)
+
+            annot.xy = sc_client.get_offsets()[ind]
+            annot.set_visible(not args.no_detail_box)
             return
 
-        ind = ind['ind'][0]
-        annot.set_text(packet_text_to_disply(client_data_records[ind]))
-        annot.xy = sc_client.get_offsets()[ind]
-        if not args.no_detail_box:
-            annot.set_visible(True)
+        ok, ind = sc_server_data.contains(event)
+        if ok:
+            ind = ind['ind'][0]
+            server_data_pkt = server_plotter.data_curve_packets[ind]
+            client_data_pkt = getattr(server_data_pkt, 'pair_pkt', None)
+            self.draw_information(client_data_pkt, server_data_pkt)
 
-if args.server_csv:
-    handler = MouseEventHandler()
-    fig.canvas.mpl_connect("button_press_event", handler.onpress)
-    fig.canvas.mpl_connect("motion_notify_event", handler.onmove)
-    fig.canvas.mpl_connect("button_release_event", handler.onrelease)
+            annot.xy = sc_server_data.get_offsets()[ind]
+            annot.set_visible(not args.no_detail_box)
+            return
+
+        annot.set_visible(False)
+        return
+
+    def draw_information(self, client_data_pkt, server_data_pkt):
+        client_ack_pkt = getattr(client_data_pkt, 'ack_pkt', None)
+        server_ack_pkt = getattr(client_ack_pkt, 'pair_pkt', None)
+
+        result_str = f"Server Data No. {getattr(server_data_pkt, 'no', None)}\n"
+        if server_data_pkt is not None:
+            result_str += f"SEQ: {server_data_pkt.seq}\n"
+            result_str += f"LEN: {server_data_pkt.len}\n"
+        result_str += "\n"
+
+        result_str += f"Client Data No. {getattr(client_data_pkt, 'no', None)}\n"
+        if client_data_pkt is not None:
+            result_str += f"SEQ: {client_data_pkt.seq}\n"
+            result_str += f"LEN: {client_data_pkt.len}\n"
+        result_str += "\n"
+
+        result_str += f"Client ACK No. {getattr(client_ack_pkt, 'no', None)}\n"
+        result_str += f"Server ACK No. {getattr(server_ack_pkt, 'no', None)}\n"
+        if client_ack_pkt is not None:
+            result_str += f"ACK: {client_ack_pkt.ack}\n"
+
+        if client_data_pkt is not None and server_data_pkt is not None:
+            draw_new_line(sc_client.get_offsets()[client_data_pkt.curve_id], \
+                    sc_server_data.get_offsets()[server_data_pkt.curve_id])
+        if client_data_pkt is not None and server_ack_pkt is not None:
+            draw_new_line(sc_client.get_offsets()[client_data_pkt.curve_id], \
+                    sc_server_ack.get_offsets()[server_ack_pkt.curve_id])
+
+        annot.set_text(result_str[:-1])
+
+handler = MouseEventHandler()
+fig.canvas.mpl_connect("button_press_event", handler.onpress)
+fig.canvas.mpl_connect("motion_notify_event", handler.onmove)
+fig.canvas.mpl_connect("button_release_event", handler.onrelease)
 
 plt.show()
