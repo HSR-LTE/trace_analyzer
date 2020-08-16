@@ -15,18 +15,18 @@ def get_packets(client_records, server_records, tsdelta):
                  (server_records[0]['_ws.col.Source'], \
                   server_records[0]['_ws.col.Destination']) \
                  if server_records else ('', ''))
-    assert '1' == client_records[0]['tcp.flags.syn']
-    assert '0' == client_records[0]['tcp.flags.ack']
+    assert '1' == client_records[0].get('tcp.flags.syn', '1')
+    assert '0' == client_records[0].get('tcp.flags.ack', '0')
     if server_records:
-        assert '1' == server_records[0]['tcp.flags.syn']
-        assert '0' == server_records[0]['tcp.flags.ack']
+        assert '1' == server_records[0].get('tcp.flags.syn', '1')
+        assert '0' == server_records[0].get('tcp.flags.ack', '0')
 
     tsbase = float(client_records[0]['timestamp'])
     client_records.append(dict(timestamp='inf'))
     server_records.append(dict(timestamp='inf'))
 
     def is_ack_record(record, is_server):
-        if int(record['tcp.flags.syn']):
+        if int(record.get('tcp.flags.syn', '0')):
             return -1
         client, server = endpoints[bool(is_server)]
         if record['_ws.col.Source'] == client and \
@@ -47,12 +47,14 @@ def get_packets(client_records, server_records, tsdelta):
         else:
             packet.type = PACKET_CLIENT_ACK if is_ack else PACKET_CLIENT_DATA
         packet.no = int(record['_ws.col.No.'])
-        packet.seq = int(record['tcp.seq'])
-        packet.ack = int(record['tcp.ack'])
+        packet.seq = int(record.get('tcp.seq', '0'))
+        packet.ack = int(record.get('tcp.ack', '0'))
         packet.len = int(record['tcp.len'])
-        packet.tsval = int(record['tcp.options.timestamp.tsval'])
-        packet.tsecr = int(record['tcp.options.timestamp.tsecr'])
+        packet.tsval = int(record.get('tcp.options.timestamp.tsval', '0'))
+        packet.tsecr = int(record.get('tcp.options.timestamp.tsecr', '0'))
         packet.end_seq = ctypes.c_uint32(packet.seq + packet.len).value
+        # FIXME: Some fields don't exist in UDP. Maybe a more elegant way
+        #        to deal with them is needed here.
 
     packets = []
     i = j = 0
@@ -92,6 +94,10 @@ def read_records(filename):
     for row in csv_reader:
         if titles is None:
             titles = row
+            if titles.count('timestamp') == 0:
+                titles[titles.index('_ws.col.Time')] = 'timestamp'
+            if titles.count('udp.length') > 0:
+                titles[titles.index('udp.length')] = 'tcp.len'
             continue
 
         row = dict(zip(titles, row))
@@ -101,15 +107,15 @@ def read_records(filename):
             server_addr = row['_ws.col.Destination']
 
         records.append(row)
-        row['id'] = len(records) - 1
         if row['_ws.col.Source'] == client_addr and \
                 not int(row['tcp.len']):
             ack_records.append(row)
-            row['ack_id'] = len(ack_records) - 1
         if row['_ws.col.Source'] == server_addr and \
                 int(row['tcp.len']):
             data_records.append(row)
-            row['data_id'] = len(data_records) - 1
+
+        if len(records) >= 100000:
+            break
 
     csv_file.close()
     return records, data_records, ack_records

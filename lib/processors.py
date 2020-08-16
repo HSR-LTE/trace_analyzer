@@ -177,11 +177,17 @@ class ServerPlotter(PacketProcessor):
             self.curve_y.append(val)
 
     def handle_server_ack(self, packet):
+        newly_acked = 0
         if not self.snd_una or after(packet.ack, self.snd_una):
-            self.bytes_acked += minus(packet.ack, self.snd_una)
+            newly_acked = minus(packet.ack, self.snd_una)
+            self.bytes_acked += newly_acked
+            if not self.snd_una:
+                newly_acked = 0
             self.snd_una = packet.ack # TODO: SACK
 
+        self.newly_acked = newly_acked
         val = super().handle_server_ack(packet)
+        del self.newly_acked
 
         packet.curve_id = len(self.ack_curve_packets)
         self.ack_curve_packets.append(packet)
@@ -304,3 +310,44 @@ class ServerBwPlotter(ServerPlotter):
         size = self.bytes_acked - old['bytes_acked']
         time = packet.timestamp - old['time']
         return size / time
+
+class WindowMeasure:
+    def __init__(self, win_size):
+        self.window = []
+        self.sum = 0
+        self.win_size = win_size
+
+    def append(self, time, data):
+        self.window.append((time, data))
+        self.sum += data
+        i = 0
+        while self.window[i][0] <= time - self.win_size:
+            self.sum -= self.window[i][1]
+            i += 1
+        self.window = self.window[i:]
+        return self.sum
+
+class ClientWinBwPlotter(ClientPlotter):
+    def __init__(self, win=0.25):
+        super().__init__()
+        self.win = WindowMeasure(win)
+        self.win_size = win
+
+    def on_client_data(self, packet):
+        sz = self.win.append(packet.timestamp, packet.len)
+        return sz / self.win_size
+
+class ServerWinBwPlotter(ServerPlotter):
+    def __init__(self, win=0.25):
+        super().__init__()
+        self.data_win = WindowMeasure(win)
+        self.ack_win = WindowMeasure(win)
+        self.win_size = win
+
+    def on_server_data(self, packet):
+        sz = self.data_win.append(packet.timestamp, packet.len)
+        return sz / self.win_size
+
+    def on_server_ack(self, packet):
+        sz = self.ack_win.append(packet.timestamp, self.newly_acked)
+        return sz / self.win_size

@@ -5,7 +5,7 @@ from lib.processors import *
 
 parser = argparse.ArgumentParser()
 parser.add_argument('client_csv')
-parser.add_argument('--plotter', '-p', choices=['rtt', 'bw', 'bif'], required=True)
+parser.add_argument('--plotter', '-p', choices=['rtt', 'bw', 'bif', 'win-bw'], required=True)
 parser.add_argument('--server-csv', '-s')
 parser.add_argument('--timestamp-align', '-t')
 parser.add_argument('--no-detail-box', action='store_true')
@@ -19,9 +19,10 @@ try:
 except ValueError:
     pass
 
-plotter_dict = {'rtt': (ClientRttPlotter, ServerRttPlotter, ), \
-                'bw' : (ClientBwPlotter,  ServerBwPlotter,  ), \
-                'bif': (ClientBifPlotter, ServerBifPlotter, ), }
+plotter_dict = {'rtt'    : (ClientRttPlotter,   ServerRttPlotter,   ), \
+                'bw'     : (ClientBwPlotter,    ServerBwPlotter,    ), \
+                'bif'    : (ClientBifPlotter,   ServerBifPlotter,   ), \
+                'win-bw' : (ClientWinBwPlotter, ServerWinBwPlotter, ), }
 
 client_records, client_data_records, client_ack_records = read_records(args.client_csv)
 
